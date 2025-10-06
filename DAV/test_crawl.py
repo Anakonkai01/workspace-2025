@@ -1,17 +1,9 @@
-# Cần cài đặt các thư viện cần thiết nếu bạn chưa có
-# Mở terminal và chạy các lệnh sau:
-# pip install requests
-# pip install beautifulsoup4
-
 import requests
 from bs4 import BeautifulSoup
 import time
 import csv
 
-# ==============================================================================
-# HÀM 1: CÀO DỮ LIỆU CHI TIẾT TỪ MỘT TRANG SẢN PHẨM
-# Hàm này được giữ nguyên, nó sẽ được gọi cho mỗi sản phẩm tìm thấy.
-# ==============================================================================
+
 def crawl_laptop_data(product_url):
     """Hàm này cào dữ liệu chi tiết từ một URL sản phẩm cụ thể."""
     print(f"  -> Đang lấy chi tiết từ: {product_url}")
@@ -59,9 +51,7 @@ def crawl_laptop_data(product_url):
         print(f"    LỖI: Đã có lỗi xảy ra khi xử lý URL: {e}")
         return None
 
-# ==============================================================================
-# PHẦN CHÍNH CỦA CHƯƠNG TRÌNH
-# ==============================================================================
+
 
 # --- GIAI ĐOẠN 1: Lấy tất cả URL sản phẩm qua API GraphQL (THAY THẾ CHO CODE CŨ) ---
 GRAPHQL_URL = 'https://api.cellphones.com.vn/v2/graphql/query'
