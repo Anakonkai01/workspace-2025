@@ -5,10 +5,10 @@ from collections import defaultdict
 import pickle
 
 # =============================================================================
-# === BIẾN TOÀN CỤC (Hard-coded) ===
+# GLOBAL VARIABLES (Hard-coded Parameters)
 # =============================================================================
 
-# --- Thông số cho MÀU XANH DƯƠNG (Blue) ---
+# --- Blue Color Parameters ---
 blue_lower_h = 102
 blue_upper_h = 144
 blue_lower_s = 216 
@@ -21,7 +21,7 @@ blue_close_iter = 5
 blue_clahe_clip_limit = 30 
 blue_blur_ksize = 7
 
-# --- Thông số cho MÀU ĐỎ (Red) ---
+# --- Red Color Parameters ---
 red_lower_h = 117
 red_upper_h = 179
 red_lower_s = 40
@@ -34,7 +34,7 @@ red_close_iter = 5
 red_clahe_clip_limit = 30
 red_blur_ksize = 5
 
-# --- Thông số cho MÀU VÀNG (Yellow) ---
+# --- Yellow Color Parameters ---
 yellow_lower_h = 8
 yellow_upper_h = 18
 yellow_lower_s = 111 
@@ -47,18 +47,18 @@ yellow_close_iter = 5
 yellow_clahe_clip_limit = 30
 yellow_blur_ksize = 7
 
-# --- Thông số Temporal Filtering ---
-MIN_DURATION_SEC = 2.0      # Thời gian tối thiểu để coi là biển báo thật
-MAX_GAP_SEC = 0.5       # Khoảng trống tối đa cho phép (xử lý flicker)
-IOU_THRESHOLD = 0.3         # Ngưỡng IoU để match objects
+# --- Temporal Filtering Parameters ---
+MIN_DURATION_SEC = 2.0      # Minimum duration to consider as valid traffic sign
+MAX_GAP_SEC = 0.5           # Maximum gap allowed (handles flicker)
+IOU_THRESHOLD = 0.3         # IoU threshold for object matching
 
 
 # =============================================================================
-# === CLASS TEMPORAL FILTER ===
+# TEMPORAL FILTER CLASS
 # =============================================================================
 
 class TemporalSignFilter:
-    """Lọc biển báo dựa trên temporal consistency"""
+    """Filter traffic signs based on temporal consistency"""
     
     def __init__(self, fps, min_duration_sec=3.0, max_gap_sec=0.5, iou_threshold=0.3):
         self.fps = fps
@@ -70,7 +70,7 @@ class TemporalSignFilter:
         self.next_track_id = 0
         
     def calculate_iou(self, box1, box2):
-        """Tính IoU giữa 2 bounding boxes (x, y, w, h)"""
+        """Calculate IoU between two bounding boxes (x, y, w, h)"""
         x1, y1, w1, h1 = box1
         x2, y2, w2, h2 = box2
         
@@ -93,7 +93,7 @@ class TemporalSignFilter:
         return inter_area / union_area if union_area > 0 else 0.0
     
     def add_detections(self, frame_num, detections):
-        """Thêm detections từ frame hiện tại"""
+        """Add detections from current frame"""
         for bbox, color in detections:
             best_match_id = None
             best_iou = 0
@@ -127,7 +127,7 @@ class TemporalSignFilter:
                 self.next_track_id += 1
     
     def get_validated_detections(self, frame_num):
-        """Lấy các detections đã được validate cho frame cụ thể"""
+        """Get validated detections for a specific frame"""
         validated = []
         
         for track_id, track_data in self.tracks.items():
@@ -146,7 +146,7 @@ class TemporalSignFilter:
         return validated
     
     def get_statistics(self):
-        """Lấy thống kê về tracking"""
+        """Get tracking statistics"""
         total_tracks = len(self.tracks)
         valid_tracks = sum(1 for track in self.tracks.values() 
                            if len(track) > 0 and 
@@ -155,10 +155,11 @@ class TemporalSignFilter:
 
 
 # =============================================================================
-# === HÀM HỖ TRỢ CHUNG ===
+# UTILITY FUNCTIONS
 # =============================================================================
 
 def morphology(mask, k_size, iter_opening, iter_close):
+    """Apply morphological operations to clean mask"""
     k_size = max(1, k_size)
     if k_size % 2 == 0:
         k_size += 1
@@ -168,6 +169,7 @@ def morphology(mask, k_size, iter_opening, iter_close):
     return mask_clean
 
 def preprocess_frame(frame, clip_limit, blur_ksize):
+    """Preprocess frame with blur, HSV conversion, and CLAHE"""
     blur_ksize = max(3, blur_ksize)
     if blur_ksize % 2 == 0:
         blur_ksize += 1
@@ -185,11 +187,11 @@ def preprocess_frame(frame, clip_limit, blur_ksize):
 
 
 # =============================================================================
-# === HÀM PHÁT HIỆN VÀ TRÍCH XUẤT DETECTIONS ===
+# DETECTION AND EXTRACTION FUNCTIONS
 # =============================================================================
 
 def extract_circle_detections(mask, roi_params, color_type):
-    """Trích xuất detections hình tròn từ mask"""
+    """Extract circular detections from mask"""
     (roi_x_start, roi_y_start, roi_x_end, roi_y_end) = roi_params
     detections = []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -225,7 +227,7 @@ def extract_circle_detections(mask, roi_params, color_type):
     return detections
 
 def extract_triangle_detections(mask, roi_params, color_type):
-    """(CHỈNH SỬA) Trích xuất detections hình tam giác từ mask (ĐÃ THÊM ROI)"""
+    """Extract triangular detections from mask (with ROI)"""
     (roi_x_start, roi_y_start, roi_x_end, roi_y_end) = roi_params
     detections = []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -233,7 +235,7 @@ def extract_triangle_detections(mask, roi_params, color_type):
     for contour in contours:
         area = cv2.contourArea(contour)
         
-        # Ngưỡng diện tích (điều chỉnh nếu cần)
+        # Area threshold (adjust if needed)
         if area < 825: 
             continue
             
@@ -259,7 +261,7 @@ def extract_triangle_detections(mask, roi_params, color_type):
 
         solidity = float(area) / hull_area
         
-        # Ngưỡng độ "đặc" (điều chỉnh nếu cần, vd: 0.84)
+        # Solidity threshold (adjust if needed, e.g., 0.84)
         if solidity <= 0.75: 
             continue
 
@@ -267,17 +269,18 @@ def extract_triangle_detections(mask, roi_params, color_type):
         approx = cv2.approxPolyDP(contour, epsilon, True)
         num_vertices = len(approx)
         
-        if num_vertices <= 7: # Lọc hình tam giác
+        # Filter for triangular shapes
+        if num_vertices <= 7:
             detections.append(((x, y, w, h), color_type))
             
     return detections
 
 def draw_detections(frame, detections):
-    """Vẽ bounding boxes lên frame"""
+    """Draw bounding boxes on frame"""
     color_map = {
-        'blue': (255, 0, 0),    # BGR
+        'blue': (255, 0, 0),
         'red': (0, 0, 255),
-        'yellow': (0, 255, 255) # BGR
+        'yellow': (0, 255, 255)
     }
     
     for bbox, color_type in detections:
@@ -289,22 +292,22 @@ def draw_detections(frame, detections):
 
 
 # =============================================================================
-# === CHƯƠNG TRÌNH CHÍNH - TWO PASS PROCESSING ===
+# MAIN PROGRAM - TWO PASS PROCESSING
 # =============================================================================
 
 def main():
     input_video = 'task1.mp4'
-    temp_output = 'temp_all_detections.pkl'  # File lưu trữ tạm
+    temp_output = 'temp_all_detections.pkl'
     final_output = 'detected_signs_filtered.mp4'
     
-    # --- Kiểm tra file tồn tại ---
+    # Check if video file exists
     cap_test = cv2.VideoCapture(input_video)
     if not cap_test.isOpened():
-        print(f"❌ Lỗi: Không thể mở video '{input_video}'")
+        print(f"❌ Error: Cannot open video '{input_video}'")
         return
     cap_test.release()
     
-    # --- Lấy thông số video ---
+    # Get video parameters
     cap = cv2.VideoCapture(input_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps == 0: 
@@ -318,17 +321,17 @@ def main():
     print("        🚦  TRAFFIC SIGN DETECTION WITH TEMPORAL FILTERING")
     print("=" * 60)
     print(f"📹 Video: {input_video}")
-    print(f"📐 Kích thước: {w_orig}x{h_orig} @ {fps:.2f} FPS")
-    print(f"🎞️  Tổng frames: {total_frames}")
-    print(f"⏱️  Thời gian tối thiểu: {MIN_DURATION_SEC}s ({int(MIN_DURATION_SEC * fps)} frames)")
+    print(f"📐 Resolution: {w_orig}x{h_orig} @ {fps:.2f} FPS")
+    print(f"🎞️  Total frames: {total_frames}")
+    print(f"⏱️  Minimum duration: {MIN_DURATION_SEC}s ({int(MIN_DURATION_SEC * fps)} frames)")
     print(f"⚡ Flicker tolerance: {MAX_GAP_SEC}s ({int(MAX_GAP_SEC * fps)} frames)")
     print("=" * 60)
     
     # =========================================================================
-    # === PASS 1: DETECT VÀ LƯU TẤT CẢ DETECTIONS ===
+    # PASS 1: DETECT AND SAVE ALL DETECTIONS
     # =========================================================================
     
-    print("\n🔍 PASS 1: Phát hiện tất cả biển báo...")
+    print("\n🔍 PASS 1: Detecting all traffic signs...")
     start_pass1 = time.time()
     
     temporal_filter = TemporalSignFilter(
@@ -348,82 +351,83 @@ def main():
         
         frame_count += 1
         
-        # In tiến độ
+        # Print progress
         if frame_count % 100 == 0:
-            print(f"   📊 Đã xử lý {frame_count}/{total_frames} frames...")
+            print(f"   📊 Processed {frame_count}/{total_frames} frames...")
         
-        # Cắt vùng xử lý (47.5% phía trên)
+        # Crop processing area (top 47.5%)
         height_new = int(h_orig * 0.475)
         width_new = w_orig
         frame_to_process = frame_full[0:height_new, 0:width_new]
         
-        # === XỬ LÝ MÀU XANH DƯƠNG ===
+        # Process BLUE
         hsv_blue = preprocess_frame(frame_to_process, blue_clahe_clip_limit, blue_blur_ksize)
         lower_blue = np.array([blue_lower_h, blue_lower_s, blue_lower_v])
         upper_blue = np.array([blue_upper_h, blue_upper_s, blue_upper_v])
         mask_blue = cv2.inRange(hsv_blue, lower_blue, upper_blue)
         mask_blue_clean = morphology(mask_blue, blue_ksize, blue_open_iter, blue_close_iter)
         
-        # === XỬ LÝ MÀU ĐỎ ===
+        # Process RED
         hsv_red = preprocess_frame(frame_to_process, red_clahe_clip_limit, red_blur_ksize)
         lower_red = np.array([red_lower_h, red_lower_s, red_lower_v])
         upper_red = np.array([red_upper_h, red_upper_s, red_upper_v])
         mask_red = cv2.inRange(hsv_red, lower_red, upper_red)
         mask_red_clean = morphology(mask_red, red_ksize, red_open_iter, red_close_iter)
         
-        # === XỬ LÝ MÀU VÀNG ===
+        # Process YELLOW
         hsv_yellow = preprocess_frame(frame_to_process, yellow_clahe_clip_limit, yellow_blur_ksize)
         lower_yellow = np.array([yellow_lower_h, yellow_lower_s, yellow_lower_v])
         upper_yellow = np.array([yellow_upper_h, yellow_upper_s, yellow_upper_v])
         mask_yellow = cv2.inRange(hsv_yellow, lower_yellow, upper_yellow)
         mask_yellow_clean = morphology(mask_yellow, yellow_ksize, yellow_open_iter, yellow_close_iter)
         
-        
+        # Define ROI parameters for each color
         blue_roi_params = (
-            int(width_new * 0.45), # roi_x_start
-            0,                     # roi_y_start
-            width_new,             # roi_x_end
-            height_new             # roi_y_end
+            int(width_new * 0.45),
+            0,
+            width_new,
+            height_new
         )
         
         red_roi_params = (
-            int(width_new * 0.45), # roi_x_start
-            0,                     # roi_y_start
-            width_new,             # roi_x_end
-            int(height_new*0.94)   # roi_y_end
+            int(width_new * 0.45),
+            0,
+            width_new,
+            int(height_new * 0.94)
         )
         
         yellow_roi_params = (
-            int(width_new * 0.45), # roi_x_start
-            int(height_new * 0.5), # roi_y_start
-            width_new,             # roi_x_end
-            int(height_new * 0.9)  # roi_y_end
+            int(width_new * 0.45),
+            int(height_new * 0.5),
+            width_new,
+            int(height_new * 0.9)
         )
         
+        # Extract detections
         all_detections = []
         all_detections.extend(extract_circle_detections(mask_blue_clean, blue_roi_params, 'blue'))
         all_detections.extend(extract_circle_detections(mask_red_clean, red_roi_params, 'red'))
         all_detections.extend(extract_triangle_detections(mask_yellow_clean, yellow_roi_params, 'yellow'))
         
-        # Thêm vào temporal filter
+        # Add to temporal filter
         temporal_filter.add_detections(frame_count - 1, all_detections)
     
     cap.release()
     end_pass1 = time.time()
     
-    # Thống kê Pass 1
+    # Pass 1 statistics
     total_tracks, valid_tracks = temporal_filter.get_statistics()
-    print(f"\n✅ PASS 1 hoàn thành trong {end_pass1 - start_pass1:.2f}s")
-    print(f"📊 Thống kê:")
-    print(f"   • Tổng số tracks phát hiện: {total_tracks}")
-    print(f"   • Tracks hợp lệ (≥{MIN_DURATION_SEC}s): {valid_tracks}")
-    print(f"   • Tracks bị loại (noise): {total_tracks - valid_tracks}")
+    print(f"\n✅ PASS 1 completed in {end_pass1 - start_pass1:.2f}s")
+    print(f"📊 Statistics:")
+    print(f"   • Total tracks detected: {total_tracks}")
+    print(f"   • Valid tracks (≥{MIN_DURATION_SEC}s): {valid_tracks}")
+    print(f"   • Filtered tracks (noise): {total_tracks - valid_tracks}")
     
     # =========================================================================
-    # === PASS 2: VẼ LẠI VIDEO VỚI CHỈ VALIDATED DETECTIONS ===
+    # PASS 2: RENDER VIDEO WITH VALIDATED DETECTIONS ONLY
     # =========================================================================
     
-    print(f"\n🎨 PASS 2: Tạo video với temporal filtering...")
+    print(f"\n🎨 PASS 2: Creating video with temporal filtering...")
     start_pass2 = time.time()
     
     cap = cv2.VideoCapture(input_video)
@@ -431,7 +435,7 @@ def main():
     video_writer = cv2.VideoWriter(final_output, fourcc, fps, (w_orig, h_orig))
     
     if not video_writer.isOpened():
-        print(f"❌ Lỗi: Không thể tạo file output '{final_output}'")
+        print(f"❌ Error: Cannot create output file '{final_output}'")
         cap.release()
         return
     
@@ -445,15 +449,15 @@ def main():
         frame_count += 1
         
         if frame_count % 100 == 0:
-            print(f"   🎬 Đã render {frame_count}/{total_frames} frames...")
+            print(f"   🎬 Rendered {frame_count}/{total_frames} frames...")
         
-        # Lấy validated detections cho frame này
+        # Get validated detections for this frame
         validated = temporal_filter.get_validated_detections(frame_count - 1)
         
-        # Chỉ vẽ các detections đã lọc, KHÔNG VẼ ROI
+        # Draw only filtered detections (no ROI drawn)
         frame_output = draw_detections(frame_full.copy(), validated)
         
-        # Lưu frame
+        # Save frame
         video_writer.write(frame_output)
     
     cap.release()
@@ -461,25 +465,25 @@ def main():
     end_pass2 = time.time()
     
     # =========================================================================
-    # === KẾT THÚC ===
+    # COMPLETION
     # =========================================================================
     
     total_time = end_pass2 - start_pass1
     
     print("\n" + "=" * 60)
-    print("✅  XỬ LÝ HOÀN TẤT!")
+    print("✅  PROCESSING COMPLETE!")
     print("=" * 60)
-    print(f"📁 File output: {final_output}")
-    print(f"⏱️  Thời gian Pass 1: {end_pass1 - start_pass1:.2f}s")
-    print(f"⏱️  Thời gian Pass 2: {end_pass2 - start_pass2:.2f}s")
-    print(f"⏱️  Tổng thời gian: {total_time:.2f}s")
+    print(f"📁 Output file: {final_output}")
+    print(f"⏱️  Pass 1 time: {end_pass1 - start_pass1:.2f}s")
+    print(f"⏱️  Pass 2 time: {end_pass2 - start_pass2:.2f}s")
+    print(f"⏱️  Total time: {total_time:.2f}s")
     
-    if total_tracks > 0: # Tránh lỗi chia cho 0
-        print(f"\n📈 Hiệu quả lọc nhiễu:")
-        print(f"   • Đã loại bỏ {total_tracks - valid_tracks}/{total_tracks} tracks")
-        print(f"   • Tỷ lệ giữ lại: {valid_tracks/total_tracks*100:.1f}%")
+    if total_tracks > 0:
+        print(f"\n📈 Noise filtering efficiency:")
+        print(f"   • Removed {total_tracks - valid_tracks}/{total_tracks} tracks")
+        print(f"   • Retention rate: {valid_tracks/total_tracks*100:.1f}%")
     else:
-        print("\n📈 Không phát hiện được track nào.")
+        print("\n📈 No tracks detected.")
         
     print("=" * 60)
 
