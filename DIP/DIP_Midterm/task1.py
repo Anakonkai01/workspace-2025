@@ -52,11 +52,17 @@ yellow_close_iter = 5
 yellow_clahe_clip_limit = 30
 yellow_blur_ksize = 7
 
+# --- Area Parameters ---
+CIRCLE_MIN_AREA = 300
+CIRCLE_MAX_AREA = 15000
+TRIANGLE_MIN_AREA = 825
+TRIANGLE_MAX_AREA = 50000
+
 # --- ROI Parameters (FULL FRAME coordinates - easy to modify) ---
 # Format: (x_start, y_start, x_end, y_end) in percentage of full frame
 # These will be converted to actual pixels based on video resolution
-BLUE_ROI = (0.0, 0.0, 0.6, 0.475)      # x: 0%-60%, y: 0%-47.5%
-RED_ROI = (0.0, 0.0, 1.0, 0.445)       # x: 0%-100%, y: 0%-44.6% (94% of 47.5%)
+BLUE_ROI = (0.0, 0.0, 0.6, 0.475)      # x: 45%-100%, y: 0%-47.5%
+RED_ROI = (0.45, 0.0, 1.0, 0.445)       # x: 45%-100%, y: 0%-44.5%
 YELLOW_ROI = (0.45, 0.2375, 1.0, 0.4275) # x: 45%-100%, y: 23.75%-42.75% (50%-90% of 47.5%)
 
 # --- Temporal Filtering Parameters ---
@@ -67,6 +73,9 @@ IOU_THRESHOLD = 0.3
 # --- Processing Limit ---
 MAX_FRAME_ID = 2800  # Stop detection at this frame
 
+# --- Debug Mode Toggle ---
+DEBUG_MODE = True  # Set to False to disable ROI boxes and metrics overlay
+
 # --- Performance Parameters (AUTO-DETECTED) ---
 CPU_CORES = cpu_count()
 NUM_READ_THREADS = min(4, CPU_CORES // 8)           # 4 reader threads
@@ -76,6 +85,7 @@ BATCH_SIZE = 30                                     # Process frames in batches
 
 print(f"🖥️  Detected {CPU_CORES} CPU cores")
 print(f"⚡ Using {NUM_READ_THREADS} readers + {NUM_PROCESS_WORKERS} processors")
+print(f"🐛 Debug mode: {'ENABLED' if DEBUG_MODE else 'DISABLED'}")
 
 
 # =============================================================================
@@ -339,7 +349,7 @@ def is_bbox_in_roi(bbox, roi_params, overlap_threshold=0.5):
 # DETECTION FUNCTIONS (WITH METRICS)
 # =============================================================================
 
-def extract_circle_detections(mask, roi_params, color_type):
+def extract_circle_detections(mask, roi_params, color_type, min_area=300, max_area=15000):
     """Extract circular detections with metrics"""
     detections = []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -347,7 +357,7 @@ def extract_circle_detections(mask, roi_params, color_type):
     for contour in contours:
         area = cv2.contourArea(contour) 
         
-        if area < 300 or area > 15000:
+        if area < min_area or area > max_area:
             continue
         
         hull = cv2.convexHull(contour)
@@ -355,22 +365,21 @@ def extract_circle_detections(mask, roi_params, color_type):
         area_hull = cv2.contourArea(hull)
         x, y, w, h = cv2.boundingRect(hull)
         
-        # ✅ Check ROI FIRST for all detections
         is_in_roi = is_bbox_in_roi((x, y, w, h), roi_params, overlap_threshold=0.5)
-        
-        if not is_in_roi:
-            continue  # Reject anything outside ROI
 
         if perimeter_hull > 0:
             circularity = 4 * np.pi * (area_hull / (perimeter_hull * perimeter_hull))
             
-            # Adjust circularity threshold based on size
-            if area < 725 :
-                circularity_param = 0.92
-            else:
+            circularity_param = 0.87
+            if area < 725 and not is_in_roi:
+                continue
+            elif area < 725 and is_in_roi:
+                circularity_param = 0.87
+            elif area >= 725:
                 circularity_param = 0.93
 
             if circularity > circularity_param:
+                # Store bbox, color, and metrics
                 metrics = {
                     'area': int(area_hull),
                     'circularity': round(circularity, 3),
@@ -380,7 +389,7 @@ def extract_circle_detections(mask, roi_params, color_type):
                 
     return detections
 
-def extract_triangle_detections(mask, roi_params, color_type):
+def extract_triangle_detections(mask, roi_params, color_type, min_area=825, max_area=50000):
     """Extract triangular detections with metrics"""
     detections = []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -388,7 +397,7 @@ def extract_triangle_detections(mask, roi_params, color_type):
     for contour in contours:
         area = cv2.contourArea(contour)
         
-        if area < 625: 
+        if area < min_area or area > max_area: 
             continue
             
         x, y, w, h = cv2.boundingRect(contour)
@@ -428,8 +437,8 @@ def extract_triangle_detections(mask, roi_params, color_type):
             
     return detections
 
-def draw_detections_with_metrics(frame, detections):
-    """Draw bounding boxes with area and circularity/solidity metrics"""
+def draw_detections_with_metrics(frame, detections, debug_mode=True):
+    """Draw bounding boxes with optional area and circularity/solidity metrics"""
     color_map = {
         'blue': (0, 255, 0),
         'red': (0, 255, 0),
@@ -447,8 +456,8 @@ def draw_detections_with_metrics(frame, detections):
         # Draw bounding box
         cv2.rectangle(frame, (x, y), (x + w, y + h), color_bgr, 3)
         
-        # Draw metrics above the bounding box
-        if metrics:
+        # Draw metrics above the bounding box (only if debug mode is enabled)
+        if debug_mode and metrics:
             shape = metrics.get('shape', 'unknown')
             area = metrics.get('area', 0)
             
@@ -511,7 +520,7 @@ def draw_frame_id(frame, frame_num):
 
 
 # =============================================================================
-# 🚀 OPTIMIZED PASS 2 - THREADED VIDEO PROCESSING (WITH DEBUGGING)
+# 🚀 OPTIMIZED PASS 2 - THREADED VIDEO PROCESSING
 # =============================================================================
 
 def frame_reader_worker(video_path, frame_queue, start_frame, end_frame):
@@ -531,10 +540,10 @@ def frame_reader_worker(video_path, frame_queue, start_frame, end_frame):
     
     cap.release()
 
-def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_params_dict):
+def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_params_dict, debug_mode):
     """
-    🚀 Thread worker for processing frames (with debugging overlays)
-    Draws detections, ROI, and frame ID on frames
+    🚀 Thread worker for processing frames
+    Draws detections, ROI (if debug), and frame ID (if debug) on frames
     """
     while True:
         try:
@@ -547,14 +556,18 @@ def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_param
             # Get validated detections (from cache)
             validated = temporal_filter.get_validated_detections(frame_num)
             
-            # Draw frame ID
-            frame_output = draw_frame_id(frame, frame_num)
+            frame_output = frame.copy()
             
-            # Draw ROI boxes
-            frame_output = draw_roi_boxes(frame_output, roi_params_dict)
+            # Draw debug overlays only if debug mode is enabled
+            if debug_mode:
+                # Draw frame ID
+                frame_output = draw_frame_id(frame_output, frame_num)
+                
+                # Draw ROI boxes
+                frame_output = draw_roi_boxes(frame_output, roi_params_dict)
             
-            # Draw detections with metrics
-            frame_output = draw_detections_with_metrics(frame_output, validated)
+            # Draw detections (with or without metrics based on debug mode)
+            frame_output = draw_detections_with_metrics(frame_output, validated, debug_mode)
             
             # Put to output queue
             output_queue.put((frame_num, frame_output))
@@ -572,7 +585,7 @@ def process_frame_batch(args):
     Process a batch of frames in parallel (Pass 1)
     This runs in separate processes to bypass GIL
     """
-    frames_data, height_new, width_new, w_full, h_full = args
+    frames_data, height_new, width_new, w_full, h_full, circle_min, circle_max, triangle_min, triangle_max = args
     
     # ROI parameters in FULL FRAME coordinates (convert from percentages)
     blue_roi_params = convert_roi_to_pixels(BLUE_ROI, w_full, h_full)
@@ -606,19 +619,19 @@ def process_frame_batch(args):
         mask_yellow = cv2.inRange(hsv_yellow, lower_yellow, upper_yellow)
         mask_yellow_clean = morphology(mask_yellow, yellow_ksize, yellow_open_iter, yellow_close_iter)
         
-        # Extract detections (with metrics) - ROI in FULL FRAME coordinates
+        # Extract detections (with metrics and configurable area limits)
         all_detections = []
-        all_detections.extend(extract_circle_detections(mask_blue_clean, blue_roi_params, 'blue'))
-        all_detections.extend(extract_circle_detections(mask_red_clean, red_roi_params, 'red'))
-        all_detections.extend(extract_triangle_detections(mask_yellow_clean, yellow_roi_params, 'yellow'))
+        all_detections.extend(extract_circle_detections(mask_blue_clean, blue_roi_params, 'blue', circle_min, circle_max))
+        all_detections.extend(extract_circle_detections(mask_red_clean, red_roi_params, 'red', circle_min, circle_max))
+        all_detections.extend(extract_triangle_detections(mask_yellow_clean, yellow_roi_params, 'yellow', triangle_min, triangle_max))
         
         batch_results.append((frame_num, all_detections))
     
     return batch_results
 
-def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fps, resolution, roi_params_dict):
+def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fps, resolution, roi_params_dict, debug_mode):
     """
-    🚀 OPTIMIZED PASS 2 with multi-threading and debugging overlays
+    🚀 OPTIMIZED PASS 2 with multi-threading
     
     Architecture:
     1. Reader threads: Read frames from video
@@ -658,7 +671,7 @@ def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fp
     for _ in range(NUM_PROCESS_WORKERS):
         from threading import Thread
         t = Thread(target=frame_processor_worker, 
-                   args=(read_queue, process_queue, temporal_filter, roi_params_dict))
+                   args=(read_queue, process_queue, temporal_filter, roi_params_dict, debug_mode))
         t.start()
         processor_threads.append(t)
     
@@ -728,7 +741,7 @@ def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fp
 
 def main():
     input_video = 'task1.mp4'
-    final_output = 'detected_signs_ultra_fast_debug.mp4'
+    final_output = 'task1_output.mp4'
     
     # Check video
     cap_test = cv2.VideoCapture(input_video)
@@ -748,7 +761,7 @@ def main():
     cap.release()
     
     print("=" * 70)
-    print("   🚀  ULTRA-FAST TRAFFIC SIGN DETECTION (DEBUG MODE)")
+    print("   🚀  ULTRA-FAST TRAFFIC SIGN DETECTION")
     print("=" * 70)
     print(f"📹 Video: {input_video}")
     print(f"📐 Resolution: {w_orig}x{h_orig} @ {fps:.2f} FPS")
@@ -762,14 +775,20 @@ def main():
     print(f"   • Multi-threading: {NUM_READ_THREADS + NUM_PROCESS_WORKERS} threads (Pass 2)")
     print(f"   • Frame buffer: {FRAME_BUFFER_SIZE} frames")
     print(f"   • Batch size: {BATCH_SIZE} frames/batch")
+    print(f"\n📏 AREA PARAMETERS:")
+    print(f"   • Circle:   min={CIRCLE_MIN_AREA}, max={CIRCLE_MAX_AREA}")
+    print(f"   • Triangle: min={TRIANGLE_MIN_AREA}, max={TRIANGLE_MAX_AREA}")
     print(f"\n📍 ROI SETTINGS (Full Frame %):")
     print(f"   • Blue ROI:   x={BLUE_ROI[0]*100:.1f}%-{BLUE_ROI[2]*100:.1f}%, y={BLUE_ROI[1]*100:.1f}%-{BLUE_ROI[3]*100:.1f}%")
     print(f"   • Red ROI:    x={RED_ROI[0]*100:.1f}%-{RED_ROI[2]*100:.1f}%, y={RED_ROI[1]*100:.1f}%-{RED_ROI[3]*100:.1f}%")
     print(f"   • Yellow ROI: x={YELLOW_ROI[0]*100:.1f}%-{YELLOW_ROI[2]*100:.1f}%, y={YELLOW_ROI[1]*100:.1f}%-{YELLOW_ROI[3]*100:.1f}%")
-    print(f"\n🐛 DEBUG MODE:")
-    print(f"   • Frame ID overlay: Enabled")
-    print(f"   • ROI visualization: Enabled (Blue, Red, Yellow)")
-    print(f"   • Detection metrics: Area + Circularity/Solidity")
+    print(f"\n🐛 DEBUG MODE: {'ENABLED' if DEBUG_MODE else 'DISABLED'}")
+    if DEBUG_MODE:
+        print(f"   • Frame ID overlay: Enabled")
+        print(f"   • ROI visualization: Enabled")
+        print(f"   • Detection metrics: Enabled")
+    else:
+        print(f"   • Only bounding boxes will be shown")
     print("=" * 70)
     
     # =========================================================================
@@ -824,7 +843,8 @@ def main():
     batches = []
     for i in range(0, len(all_frames), BATCH_SIZE):
         batch = all_frames[i:i+BATCH_SIZE]
-        batches.append((batch, height_new, width_new, w_orig, h_orig))
+        batches.append((batch, height_new, width_new, w_orig, h_orig, 
+                       CIRCLE_MIN_AREA, CIRCLE_MAX_AREA, TRIANGLE_MIN_AREA, TRIANGLE_MAX_AREA))
     
     # Process batches in parallel using multiprocessing
     all_detections_results = []
@@ -860,7 +880,7 @@ def main():
     print(f"   • Filtered: {total_tracks - valid_tracks}")
     
     # =========================================================================
-    # PASS 2: OPTIMIZED RENDERING (WITH DEBUG OVERLAYS)
+    # PASS 2: OPTIMIZED RENDERING
     # =========================================================================
     
     # Render ALL frames from the original video (not just detected frames)
@@ -871,7 +891,8 @@ def main():
         total_frames,  # Use total frames from original video
         fps, 
         (w_orig, h_orig),
-        roi_params_dict
+        roi_params_dict,
+        DEBUG_MODE
     )
     
     if not success:
@@ -904,10 +925,11 @@ def main():
     print(f"   ✓ Frame buffering ({FRAME_BUFFER_SIZE} frames)")
     print(f"   ✓ Batch processing ({BATCH_SIZE} frames/batch)")
     
-    print("\n🐛 Debug features enabled:")
-    print(f"   ✓ Frame ID overlay")
-    print(f"   ✓ ROI visualization (Blue, Red, Yellow)")
-    print(f"   ✓ Detection metrics (Area, Circularity/Solidity)")
+    if DEBUG_MODE:
+        print("\n🐛 Debug features enabled:")
+        print(f"   ✓ Frame ID overlay")
+        print(f"   ✓ ROI visualization (Blue, Red, Yellow)")
+        print(f"   ✓ Detection metrics (Area, Circularity/Solidity)")
     print("=" * 70)
 
 
