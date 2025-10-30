@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 import pickle
 
-# =============================================================================
+# ============================================================================
 # GLOBAL VARIABLES (Hard-coded Parameters)
 # =============================================================================
 
@@ -198,7 +198,7 @@ def extract_circle_detections(mask, roi_params, color_type):
     
     for contour in contours:
         area = cv2.contourArea(contour) 
-        if area < 800 or area > 15000:
+        if area < 300 or area > 15000:
             continue
         
         hull = cv2.convexHull(contour)
