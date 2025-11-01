@@ -100,7 +100,10 @@ DEBUG_MODE = False  # Set to False to disable ROI boxes and metrics overlay
 
 # --- File Paths ---
 INPUT_VIDEO_PATH = 'task1.mp4'
-OUTPUT_VIDEO_PATH = 'task1_output.mp4'
+OUTPUT_VIDEO_PATH = '523H0164_523H0177_523H0145.mp4'
+
+# --- Student Information ---
+STUDENT_IDS = "523H0164_523H0177_523H0145"
 
 # --- Performance Parameters ---
 # Automatically detect CPU cores and optimize thread/process allocation
@@ -134,8 +137,10 @@ class TemporalSignFilter:
     
     def __init__(self, fps, color_params=None):
         """
-        color_params: Dict mapping color -> (min_duration_sec, max_gap_sec, iou_threshold)
-        Example: {'blue': (2.0, 0.5, 0.3), 'red': (1.5, 0.7, 0.25)}
+        Args:
+            fps: Frames per second of the video
+            color_params: Dict mapping color -> (min_duration_sec, max_gap_sec, iou_threshold)
+                         Example: {'blue': (2.0, 0.5, 0.3), 'red': (1.5, 0.7, 0.25)}
         """
         self.fps = fps
         
@@ -613,6 +618,50 @@ def draw_frame_id(frame, frame_num):
     return frame
 
 
+def draw_student_ids(frame, student_ids=None):
+    """Draw student IDs on the top-left corner of the frame"""
+    # Use global STUDENT_IDS if not provided
+    if student_ids is None:
+        student_ids = STUDENT_IDS
+    
+    # Position in top-left corner
+    x, y = 10, 30
+    
+    # Text properties
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    font_thickness = 2
+    text_color = (255, 255, 255)  # White
+    bg_color = (0, 0, 0)  # Black background
+    padding = 5
+    
+    # Get text size for background rectangle
+    (text_w, text_h), baseline = cv2.getTextSize(student_ids, font, font_scale, font_thickness)
+    
+    # Draw background rectangle
+    cv2.rectangle(
+        frame,
+        (x - padding, y - text_h - padding),
+        (x + text_w + padding, y + baseline + padding),
+        bg_color,
+        -1  # Filled rectangle
+    )
+    
+    # Draw student IDs text
+    cv2.putText(
+        frame,
+        student_ids,
+        (x, y),
+        font,
+        font_scale,
+        text_color,
+        font_thickness,
+        cv2.LINE_AA
+    )
+    
+    return frame
+
+
 # =============================================================================
 # OPTIMIZED RENDERING PHASE - THREADED VIDEO PROCESSING
 # =============================================================================
@@ -651,6 +700,9 @@ def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_param
             validated = temporal_filter.get_validated_detections(frame_num)
             
             frame_output = frame.copy()
+            
+            # Always draw student IDs on top-left corner
+            frame_output = draw_student_ids(frame_output)
             
             # Draw debug overlays only if debug mode is enabled
             if debug_mode:
@@ -983,7 +1035,7 @@ def main():
     # RENDERING PHASE: APPLY FILTERS AND GENERATE OUTPUT VIDEO
     # =========================================================================
     
-    # Render ALL frames from the original video
+    # Render ALL frames from the original video (not just detected frames)
     success = optimized_rendering_phase(
         input_video, 
         final_output, 
