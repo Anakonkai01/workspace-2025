@@ -1,0 +1,8 @@
+- make this code cleaner by using oop 
+- delete all the icon, emoji use in this code
+- refactor the magic number (epsilon of the triangle, circularity_param, number_vertice of the triangle ...)
+- explain in detail in comment about     
+    height_new = int(h_orig * 0.475)
+    width_new = w_orig
+- in the performance, i want it to smart to auto utilize all the resources of the computer it run on, because this file should run in difference computer
+

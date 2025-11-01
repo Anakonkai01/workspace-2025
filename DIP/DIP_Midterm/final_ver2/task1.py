@@ -2,15 +2,13 @@ import cv2
 import numpy as np 
 import time
 from collections import defaultdict
-import pickle
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import queue
 from threading import Lock, Thread
 from multiprocessing import cpu_count, Manager, Queue, Process
-import os
 
 # =============================================================================
-# GLOBAL VARIABLES (Hard-coded Parameters)
+# GLOBAL VARIABLES (Parameters)
 # =============================================================================
 
 # --- Blue Color Parameters ---
@@ -52,49 +50,110 @@ yellow_close_iter = 5
 yellow_clahe_clip_limit = 30
 yellow_blur_ksize = 7
 
-# --- ROI Parameters (FULL FRAME coordinates - easy to modify) ---
-# Format: (x_start, y_start, x_end, y_end) in percentage of full frame
-# These will be converted to actual pixels based on video resolution
-BLUE_ROI = (0.0, 0.0, 0.6, 0.475)      # x: 0%-60%, y: 0%-47.5%
-RED_ROI = (0.0, 0.0, 1.0, 0.445)       # x: 0%-100%, y: 0%-44.6% (94% of 47.5%)
-YELLOW_ROI = (0.45, 0.2375, 1.0, 0.4275) # x: 45%-100%, y: 23.75%-42.75% (50%-90% of 47.5%)
+# --- Area Parameters ---
+CIRCLE_MIN_AREA = 300
+CIRCLE_MAX_AREA = 15000
+CIRCLE_TRUST_THRESHOLD = 725  # Circles >= this area are trusted (bypass ROI check)
+TRIANGLE_MIN_AREA = 400
+TRIANGLE_MAX_AREA = 50000
+TRIANGLE_TRUST_THRESHOLD = 1500  # Triangles >= this area are trusted (bypass ROI check)
 
-# --- Temporal Filtering Parameters ---
-MIN_DURATION_SEC = 2.0
-MAX_GAP_SEC = 0.5
-IOU_THRESHOLD = 0.3
+# --- Shape Quality Parameters ---
+TRIANGLE_MIN_SOLIDITY = 0.75  # Minimum solidity (area/hull_area) for triangle detection
+TRIANGLE_EPSILON_FACTOR = 0.03  # Contour approximation accuracy (% of perimeter)
+TRIANGLE_MAX_VERTICES = 7  # Maximum vertices for triangle approximation
+CIRCLE_SMALL_CIRCULARITY = 0.87  # Circularity threshold for small circles
+CIRCLE_LARGE_CIRCULARITY = 0.93  # Circularity threshold for large circles
+
+# --- Image Processing Parameters ---
+CLAHE_CLIP_DIVISOR = 10.0  # Divisor for CLAHE clip limit normalization
+CLAHE_TILE_GRID_SIZE = (1, 1)  # Tile grid size for CLAHE (adaptive histogram equalization)
+SATURATION_BOOST_FACTOR = 1.5  # Multiplication factor for saturation enhancement
+
+# --- ROI Parameters ---
+#  (x_start, y_start, x_end, y_end) in percentage of full frame
+BLUE_ROI = (0.4, 0.0, 0.7, 0.475)      
+RED_ROI = (0.45, 0.2, 1.0, 0.445)      
+YELLOW_ROI = (0.45, 0.2375, 0.8, 0.5) 
+
+# --- Temporal Filtering Parameters  ---
+# Blue signs temporal filtering
+BLUE_MIN_DURATION_SEC = 2.0
+BLUE_MAX_GAP_SEC = 0.5
+BLUE_IOU_THRESHOLD = 0.3
+
+# Red signs temporal filtering
+RED_MIN_DURATION_SEC = 2.0
+RED_MAX_GAP_SEC = 0.5
+RED_IOU_THRESHOLD = 0.3
+
+# Yellow signs temporal filtering
+YELLOW_MIN_DURATION_SEC = 3.0
+YELLOW_MAX_GAP_SEC = 0.5
+YELLOW_IOU_THRESHOLD = 0.3
 
 # --- Processing Limit ---
 MAX_FRAME_ID = 2800  # Stop detection at this frame
 
-# --- Performance Parameters (AUTO-DETECTED) ---
-CPU_CORES = cpu_count()
-NUM_READ_THREADS = min(4, CPU_CORES // 8)           # 4 reader threads
-NUM_PROCESS_WORKERS = CPU_CORES - NUM_READ_THREADS - 2  # Use remaining cores for processing
-FRAME_BUFFER_SIZE = 120                             # Larger buffer for 32 cores
-BATCH_SIZE = 30                                     # Process frames in batches
+# --- Debug Mode Toggle ---
+DEBUG_MODE = False  # Set to False to disable ROI boxes and metrics overlay
 
-print(f"🖥️  Detected {CPU_CORES} CPU cores")
-print(f"⚡ Using {NUM_READ_THREADS} readers + {NUM_PROCESS_WORKERS} processors")
+# --- File Paths ---
+INPUT_VIDEO_PATH = 'task1.mp4'
+OUTPUT_VIDEO_PATH = 'task1_output.mp4'
+
+# --- Performance Parameters ---
+# Automatically detect CPU cores and optimize thread/process allocation
+CPU_CORES = cpu_count()
+
+# Calculate optimal number of reader threads
+NUM_READ_THREADS = max(1, min(4, CPU_CORES // 8))
+
+# Calculate optimal number of worker processes
+NUM_PROCESS_WORKERS = max(1, CPU_CORES - NUM_READ_THREADS - 2)
+
+# Frame buffer size scales with available cores
+# More cores = larger buffer for better throughput
+FRAME_BUFFER_SIZE = max(30, min(200, CPU_CORES * 4))
+
+# Batch size for frame processing
+# Balances between parallelism overhead and processing efficiency
+BATCH_SIZE = max(10, min(50, CPU_CORES))
+
+print(f"Detected {CPU_CORES} CPU cores")
+print(f"Using {NUM_READ_THREADS} readers + {NUM_PROCESS_WORKERS} processors")
+print(f"Debug mode: {'ENABLED' if DEBUG_MODE else 'DISABLED'}")
 
 
 # =============================================================================
-# TEMPORAL FILTER CLASS (OPTIMIZED)
+# TEMPORAL FILTER CLASS 
 # =============================================================================
 
 class TemporalSignFilter:
-    """Filter traffic signs based on temporal consistency"""
+    """Filter traffic signs based on temporal consistency with color-specific parameters"""
     
-    def __init__(self, fps, min_duration_sec=3.0, max_gap_sec=0.5, iou_threshold=0.3):
+    def __init__(self, fps, color_params=None):
+        """
+        color_params: Dict mapping color -> (min_duration_sec, max_gap_sec, iou_threshold)
+        Example: {'blue': (2.0, 0.5, 0.3), 'red': (1.5, 0.7, 0.25)}
+        """
         self.fps = fps
-        self.min_frames = int(min_duration_sec * fps)
-        self.max_gap_frames = int(max_gap_sec * fps)
-        self.iou_threshold = iou_threshold
+        
+        # Store color-specific parameters
+        self.min_frames = {}
+        self.max_gap_frames = {}
+        self.iou_thresholds = {}
+        
+        if color_params:
+            for color, (min_dur, max_gap, iou_thresh) in color_params.items():
+                self.min_frames[color] = int(min_dur * fps)
+                self.max_gap_frames[color] = int(max_gap * fps)
+                self.iou_thresholds[color] = iou_thresh
         
         self.tracks = defaultdict(list)
         self.next_track_id = 0
         
-        # Cache for validated detections (OPTIMIZATION)
+        # Cache for validated detections 
         self._validated_cache = {}
         self._cache_built = False
         
@@ -122,11 +181,15 @@ class TemporalSignFilter:
         return inter_area / union_area if union_area > 0 else 0.0
     
     def add_detections(self, frame_num, detections):
-        """Add detections from current frame"""
+        """Add detections from current frame with color-specific IoU threshold"""
         for detection_data in detections:
             bbox, color = detection_data[0], detection_data[1]
             # Extract metrics if available (for debugging)
             metrics = detection_data[2] if len(detection_data) > 2 else {}
+            
+            # Use color-specific IoU threshold
+            iou_threshold = self.iou_thresholds.get(color, 0.3)
+            max_gap = self.max_gap_frames.get(color, int(0.5 * self.fps))
             
             best_match_id = None
             best_iou = 0
@@ -138,10 +201,10 @@ class TemporalSignFilter:
                 last_detection = track_data[-1]
                 
                 if (last_detection['color'] == color and 
-                    frame_num - last_detection['frame'] <= self.max_gap_frames):
+                    frame_num - last_detection['frame'] <= max_gap):
                     
                     iou = self.calculate_iou(bbox, last_detection['bbox'])
-                    if iou > best_iou and iou >= self.iou_threshold:
+                    if iou > best_iou and iou >= iou_threshold:
                         best_iou = iou
                         best_match_id = track_id
             
@@ -161,10 +224,13 @@ class TemporalSignFilter:
                 }]
                 self.next_track_id += 1
     
-    def interpolate_missing_frames(self, track_data):
-        """Fill missing frames with linear interpolation"""
+    def interpolate_missing_frames(self, track_data, color):
+        """Fill missing frames with linear interpolation using color-specific max gap"""
         if len(track_data) < 2:
             return track_data
+        
+        # Get color-specific max gap
+        max_gap = self.max_gap_frames.get(color, int(0.5 * self.fps))
         
         interpolated = []
         
@@ -176,7 +242,7 @@ class TemporalSignFilter:
             
             frame_gap = next_det['frame'] - current['frame']
             
-            if 1 < frame_gap <= self.max_gap_frames:
+            if 1 < frame_gap <= max_gap:
                 x1, y1, w1, h1 = current['bbox']
                 x2, y2, w2, h2 = next_det['bbox']
                 
@@ -225,22 +291,27 @@ class TemporalSignFilter:
     
     def build_detection_cache(self):
         """
-        🚀 OPTIMIZATION: Pre-build cache of all validated detections
-        This eliminates repeated computation in Pass 2
+        Uses color-specific minimum duration for validation
         """
-        print("   🔧 Building detection cache...")
+        print("   Building detection cache...")
         start = time.time()
         
         for track_id, track_data in self.tracks.items():
             if len(track_data) == 0:
                 continue
             
+            # Get color from first detection
+            color = track_data[0]['color']
+            
+            # Use color-specific minimum frames
+            min_frames_for_color = self.min_frames.get(color, int(2.0 * self.fps))
+            
             first_frame = track_data[0]['frame']
             last_frame = track_data[-1]['frame']
             duration_frames = last_frame - first_frame + 1
             
-            if duration_frames >= self.min_frames:
-                interpolated = self.interpolate_missing_frames(track_data)
+            if duration_frames >= min_frames_for_color:
+                interpolated = self.interpolate_missing_frames(track_data, color)
                 smoothed = self.smooth_bounding_boxes(interpolated, window_size=5)
                 
                 for detection in smoothed:
@@ -252,7 +323,7 @@ class TemporalSignFilter:
                     )
         
         self._cache_built = True
-        print(f"   ✅ Cache built in {time.time() - start:.2f}s ({len(self._validated_cache)} frames)")
+        print(f"   Cache built in {time.time() - start:.2f}s ({len(self._validated_cache)} frames)")
     
     def get_validated_detections(self, frame_num):
         """Get validated detections (using cache)"""
@@ -262,11 +333,21 @@ class TemporalSignFilter:
         return self._validated_cache.get(frame_num, [])
     
     def get_statistics(self):
-        """Get tracking statistics"""
+        """Get tracking statistics with color-specific minimum frames"""
         total_tracks = len(self.tracks)
-        valid_tracks = sum(1 for track in self.tracks.values() 
-                           if len(track) > 0 and 
-                           (track[-1]['frame'] - track[0]['frame'] + 1) >= self.min_frames)
+        valid_tracks = 0
+        
+        for track in self.tracks.values():
+            if len(track) > 0:
+                # Get color from first detection
+                color = track[0]['color']
+                # Use color-specific minimum frames
+                min_frames_for_color = self.min_frames.get(color, int(2.0 * self.fps))
+                
+                duration_frames = track[-1]['frame'] - track[0]['frame'] + 1
+                if duration_frames >= min_frames_for_color:
+                    valid_tracks += 1
+        
         return total_tracks, valid_tracks
 
 
@@ -285,7 +366,7 @@ def morphology(mask, k_size, iter_opening, iter_close):
     return mask_clean
 
 def preprocess_frame(frame, clip_limit, blur_ksize):
-    """Preprocess frame"""
+    """Preprocess frame with median blur, HSV conversion, CLAHE, and saturation boost"""
     blur_ksize = max(3, blur_ksize)
     if blur_ksize % 2 == 0:
         blur_ksize += 1
@@ -293,11 +374,16 @@ def preprocess_frame(frame, clip_limit, blur_ksize):
     frame_processing = cv2.medianBlur(frame, blur_ksize) 
     frame_processing = cv2.cvtColor(frame_processing, cv2.COLOR_BGR2HSV)      
     
-    h, s, v = cv2.split(frame_processing)  
-    clahe = cv2.createCLAHE(clipLimit=clip_limit / 10.0, tileGridSize=(1,1))
+    h, s, v = cv2.split(frame_processing)
+    
+    clahe = cv2.createCLAHE(clipLimit=clip_limit / CLAHE_CLIP_DIVISOR, 
+                            tileGridSize=CLAHE_TILE_GRID_SIZE)
     v_clahe = clahe.apply(v)
-    s = s.astype(np.float32) * 1.5
+    
+    # Boost saturation to enhance color separation
+    s = s.astype(np.float32) * SATURATION_BOOST_FACTOR
     s = np.clip(s, 0, 255).astype(np.uint8)
+    
     hsv_blur_clahe = cv2.merge([h, s, v_clahe])
     return hsv_blur_clahe
 
@@ -339,15 +425,15 @@ def is_bbox_in_roi(bbox, roi_params, overlap_threshold=0.5):
 # DETECTION FUNCTIONS (WITH METRICS)
 # =============================================================================
 
-def extract_circle_detections(mask, roi_params, color_type):
-    """Extract circular detections with metrics"""
+def extract_circle_detections(mask, roi_params, color_type, min_area=300, max_area=15000):
+    """Extract circular detections with two-layer ROI logic"""
     detections = []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     for contour in contours:
         area = cv2.contourArea(contour) 
         
-        if area < 300 or area > 15000:
+        if area < min_area or area > max_area:
             continue
         
         hull = cv2.convexHull(contour)
@@ -355,22 +441,29 @@ def extract_circle_detections(mask, roi_params, color_type):
         area_hull = cv2.contourArea(hull)
         x, y, w, h = cv2.boundingRect(hull)
         
-        # ✅ Check ROI FIRST for all detections
         is_in_roi = is_bbox_in_roi((x, y, w, h), roi_params, overlap_threshold=0.5)
         
-        if not is_in_roi:
-            continue  # Reject anything outside ROI
-
+        # TWO-LAYER ROI LOGIC for circles:
+        # Layer 1: Filter small noise outside ROI
+        if area < CIRCLE_TRUST_THRESHOLD and not is_in_roi:
+            continue  # Reject small circles outside ROI (noise)
+        # Layer 2: Trust large circles, bypass ROI check
+        elif area >= CIRCLE_TRUST_THRESHOLD:
+            pass  # Allow large circles regardless of ROI (better tracking)
+        # Layer 1: Allow small circles inside ROI
+        elif area < CIRCLE_TRUST_THRESHOLD and is_in_roi:
+            pass  # Allow small circles inside ROI
+        
         if perimeter_hull > 0:
             circularity = 4 * np.pi * (area_hull / (perimeter_hull * perimeter_hull))
             
-            # Adjust circularity threshold based on size
-            if area < 725 :
-                circularity_param = 0.92
+            if area < CIRCLE_TRUST_THRESHOLD:
+                circularity_param = CIRCLE_SMALL_CIRCULARITY
             else:
-                circularity_param = 0.93
+                circularity_param = CIRCLE_LARGE_CIRCULARITY
 
             if circularity > circularity_param:
+                # Store bbox, color, and metrics
                 metrics = {
                     'area': int(area_hull),
                     'circularity': round(circularity, 3),
@@ -380,23 +473,31 @@ def extract_circle_detections(mask, roi_params, color_type):
                 
     return detections
 
-def extract_triangle_detections(mask, roi_params, color_type):
-    """Extract triangular detections with metrics"""
+def extract_triangle_detections(mask, roi_params, color_type, min_area=825, max_area=50000):
+    """Extract triangular detections with two-layer ROI logic"""
     detections = []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     for contour in contours:
         area = cv2.contourArea(contour)
         
-        if area < 625: 
+        if area < min_area or area > max_area: 
             continue
             
         x, y, w, h = cv2.boundingRect(contour)
 
         is_in_roi = is_bbox_in_roi((x, y, w, h), roi_params, overlap_threshold=0.5)
         
-        if not is_in_roi:
-            continue
+        # TWO-LAYER ROI LOGIC for triangles:
+        # Layer 1: Filter small noise outside ROI
+        if area < TRIANGLE_TRUST_THRESHOLD and not is_in_roi:
+            continue  # Reject small triangles outside ROI (noise)
+        # Layer 2: Trust large triangles, bypass ROI check
+        elif area >= TRIANGLE_TRUST_THRESHOLD:
+            pass  # Allow large triangles regardless of ROI (better tracking)
+        # Layer 1: Allow small triangles inside ROI
+        elif area < TRIANGLE_TRUST_THRESHOLD and is_in_roi:
+            pass  # Allow small triangles inside ROI
         
         hull = cv2.convexHull(contour)
         hull_area = cv2.contourArea(hull)
@@ -410,14 +511,16 @@ def extract_triangle_detections(mask, roi_params, color_type):
 
         solidity = float(area) / hull_area
         
-        if solidity <= 0.75: 
+        if solidity <= TRIANGLE_MIN_SOLIDITY:
             continue
 
-        epsilon = 0.03 * perimeter 
+        # Approximate contour to polygon with epsilon proportional to perimeter
+        epsilon = TRIANGLE_EPSILON_FACTOR * perimeter 
         approx = cv2.approxPolyDP(contour, epsilon, True)
         num_vertices = len(approx)
         
-        if num_vertices <= 7:
+        # Filter for triangular shapes (allow slight over-segmentation)
+        if num_vertices <= TRIANGLE_MAX_VERTICES:
             # Store bbox, color, and metrics
             metrics = {
                 'area': int(area),
@@ -428,8 +531,8 @@ def extract_triangle_detections(mask, roi_params, color_type):
             
     return detections
 
-def draw_detections_with_metrics(frame, detections):
-    """Draw bounding boxes with area and circularity/solidity metrics"""
+def draw_detections_with_metrics(frame, detections, debug_mode=True):
+    """Draw bounding boxes with optional area and circularity/solidity metrics"""
     color_map = {
         'blue': (0, 255, 0),
         'red': (0, 255, 0),
@@ -447,8 +550,8 @@ def draw_detections_with_metrics(frame, detections):
         # Draw bounding box
         cv2.rectangle(frame, (x, y), (x + w, y + h), color_bgr, 3)
         
-        # Draw metrics above the bounding box
-        if metrics:
+        # Draw metrics above the bounding box (only if debug mode is enabled)
+        if debug_mode and metrics:
             shape = metrics.get('shape', 'unknown')
             area = metrics.get('area', 0)
             
@@ -511,12 +614,12 @@ def draw_frame_id(frame, frame_num):
 
 
 # =============================================================================
-# 🚀 OPTIMIZED PASS 2 - THREADED VIDEO PROCESSING (WITH DEBUGGING)
+# OPTIMIZED RENDERING PHASE - THREADED VIDEO PROCESSING
 # =============================================================================
 
 def frame_reader_worker(video_path, frame_queue, start_frame, end_frame):
     """
-    🚀 Thread worker for reading frames
+    Thread worker for reading frames
     Reads frames in batches and puts them in queue
     """
     cap = cv2.VideoCapture(video_path)
@@ -531,10 +634,10 @@ def frame_reader_worker(video_path, frame_queue, start_frame, end_frame):
     
     cap.release()
 
-def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_params_dict):
+def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_params_dict, debug_mode):
     """
-    🚀 Thread worker for processing frames (with debugging overlays)
-    Draws detections, ROI, and frame ID on frames
+    Thread worker for processing frames
+    Draws detections, ROI (if debug), and frame ID (if debug) on frames
     """
     while True:
         try:
@@ -547,14 +650,18 @@ def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_param
             # Get validated detections (from cache)
             validated = temporal_filter.get_validated_detections(frame_num)
             
-            # Draw frame ID
-            frame_output = draw_frame_id(frame, frame_num)
+            frame_output = frame.copy()
             
-            # Draw ROI boxes
-            frame_output = draw_roi_boxes(frame_output, roi_params_dict)
+            # Draw debug overlays only if debug mode is enabled
+            if debug_mode:
+                # Draw frame ID
+                frame_output = draw_frame_id(frame_output, frame_num)
+                
+                # Draw ROI boxes
+                frame_output = draw_roi_boxes(frame_output, roi_params_dict)
             
-            # Draw detections with metrics
-            frame_output = draw_detections_with_metrics(frame_output, validated)
+            # Draw detections (with or without metrics based on debug mode)
+            frame_output = draw_detections_with_metrics(frame_output, validated, debug_mode)
             
             # Put to output queue
             output_queue.put((frame_num, frame_output))
@@ -564,15 +671,15 @@ def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_param
 
 
 # =============================================================================
-# 🚀 MULTIPROCESSING FUNCTIONS FOR PASS 1
+# MULTIPROCESSING FUNCTIONS FOR DETECTION PHASE
 # =============================================================================
 
 def process_frame_batch(args):
     """
-    Process a batch of frames in parallel (Pass 1)
+    Process a batch of frames in parallel (Detection Phase)
     This runs in separate processes to bypass GIL
     """
-    frames_data, height_new, width_new, w_full, h_full = args
+    frames_data, height_new, width_new, w_full, h_full, circle_min, circle_max, triangle_min, triangle_max = args
     
     # ROI parameters in FULL FRAME coordinates (convert from percentages)
     blue_roi_params = convert_roi_to_pixels(BLUE_ROI, w_full, h_full)
@@ -606,30 +713,29 @@ def process_frame_batch(args):
         mask_yellow = cv2.inRange(hsv_yellow, lower_yellow, upper_yellow)
         mask_yellow_clean = morphology(mask_yellow, yellow_ksize, yellow_open_iter, yellow_close_iter)
         
-        # Extract detections (with metrics) - ROI in FULL FRAME coordinates
+        # Extract detections (with metrics and configurable area limits)
         all_detections = []
-        all_detections.extend(extract_circle_detections(mask_blue_clean, blue_roi_params, 'blue'))
-        all_detections.extend(extract_circle_detections(mask_red_clean, red_roi_params, 'red'))
-        all_detections.extend(extract_triangle_detections(mask_yellow_clean, yellow_roi_params, 'yellow'))
+        all_detections.extend(extract_circle_detections(mask_blue_clean, blue_roi_params, 'blue', circle_min, circle_max))
+        all_detections.extend(extract_circle_detections(mask_red_clean, red_roi_params, 'red', circle_min, circle_max))
+        all_detections.extend(extract_triangle_detections(mask_yellow_clean, yellow_roi_params, 'yellow', triangle_min, triangle_max))
         
         batch_results.append((frame_num, all_detections))
     
     return batch_results
 
-def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fps, resolution, roi_params_dict):
+def optimized_rendering_phase(input_video, output_video, temporal_filter, total_frames, fps, resolution, roi_params_dict, debug_mode):
     """
-    🚀 OPTIMIZED PASS 2 with multi-threading and debugging overlays
+    OPTIMIZED RENDERING PHASE with multi-threading
     
     Architecture:
     1. Reader threads: Read frames from video
     2. Processor threads: Draw detections, ROI, frame ID (using cache)
     3. Writer thread (main): Write frames to output video in order
     
-    Speed improvement: ~3-4x faster than sequential
     """
-    print(f"\n🎨 PASS 2: Ultra-fast video rendering (multi-threaded)...")
-    print(f"   🔧 Threads: {NUM_READ_THREADS} readers + {NUM_PROCESS_WORKERS} processors")
-    start_pass2 = time.time()
+    print(f"\nRENDERING PHASE: Video rendering (multi-threaded)...")
+    print(f"   Threads: {NUM_READ_THREADS} readers + {NUM_PROCESS_WORKERS} processors")
+    start_rendering = time.time()
     
     # Build detection cache first (if not already built)
     if not temporal_filter._cache_built:
@@ -658,7 +764,7 @@ def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fp
     for _ in range(NUM_PROCESS_WORKERS):
         from threading import Thread
         t = Thread(target=frame_processor_worker, 
-                   args=(read_queue, process_queue, temporal_filter, roi_params_dict))
+                   args=(read_queue, process_queue, temporal_filter, roi_params_dict, debug_mode))
         t.start()
         processor_threads.append(t)
     
@@ -694,7 +800,7 @@ def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fp
                 # Progress
                 progress = int(frames_written / total_frames * 100)
                 if progress >= last_progress + 10:
-                    print(f"   🎬 Rendered {frames_written}/{total_frames} frames ({progress}%)")
+                    print(f"   Rendered {frames_written}/{total_frames} frames ({progress}%)")
                     last_progress = progress
                     
         except queue.Empty:
@@ -714,10 +820,10 @@ def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fp
         t.join()
     
     video_writer.release()
-    end_pass2 = time.time()
+    end_rendering = time.time()
     
-    print(f"   ✅ Pass 2 completed in {end_pass2 - start_pass2:.2f}s")
-    print(f"   ⚡ Rendering speed: {total_frames/(end_pass2 - start_pass2):.1f} FPS")
+    print(f"   Rendering phase completed in {end_rendering - start_rendering:.2f}s")
+    print(f"   Rendering speed: {total_frames/(end_rendering - start_rendering):.1f} FPS")
     
     return True
 
@@ -727,8 +833,8 @@ def optimized_pass2(input_video, output_video, temporal_filter, total_frames, fp
 # =============================================================================
 
 def main():
-    input_video = 'task1.mp4'
-    final_output = 'detected_signs_ultra_fast_debug.mp4'
+    input_video = INPUT_VIDEO_PATH
+    final_output = OUTPUT_VIDEO_PATH
     
     # Check video
     cap_test = cv2.VideoCapture(input_video)
@@ -748,48 +854,61 @@ def main():
     cap.release()
     
     print("=" * 70)
-    print("   🚀  ULTRA-FAST TRAFFIC SIGN DETECTION (DEBUG MODE)")
+    print("   TRAFFIC SIGN DETECTION WITH MULTI-PROCESSING & MULTI-THREADING")
     print("=" * 70)
-    print(f"📹 Video: {input_video}")
-    print(f"📐 Resolution: {w_orig}x{h_orig} @ {fps:.2f} FPS")
-    print(f"🎞️  Total frames: {total_frames}")
-    print(f"🛑 Processing limit: {MAX_FRAME_ID} frames")
-    print(f"⏱️  Minimum duration: {MIN_DURATION_SEC}s ({int(MIN_DURATION_SEC * fps)} frames)")
-    print(f"⚡ Flicker tolerance: {MAX_GAP_SEC}s ({int(MAX_GAP_SEC * fps)} frames)")
-    print(f"\n🔧 OPTIMIZATION:")
-    print(f"   • Detection cache: Pre-computed")
-    print(f"   • Multi-processing: {NUM_PROCESS_WORKERS} worker processes (Pass 1)")
-    print(f"   • Multi-threading: {NUM_READ_THREADS + NUM_PROCESS_WORKERS} threads (Pass 2)")
-    print(f"   • Frame buffer: {FRAME_BUFFER_SIZE} frames")
-    print(f"   • Batch size: {BATCH_SIZE} frames/batch")
-    print(f"\n📍 ROI SETTINGS (Full Frame %):")
-    print(f"   • Blue ROI:   x={BLUE_ROI[0]*100:.1f}%-{BLUE_ROI[2]*100:.1f}%, y={BLUE_ROI[1]*100:.1f}%-{BLUE_ROI[3]*100:.1f}%")
-    print(f"   • Red ROI:    x={RED_ROI[0]*100:.1f}%-{RED_ROI[2]*100:.1f}%, y={RED_ROI[1]*100:.1f}%-{RED_ROI[3]*100:.1f}%")
-    print(f"   • Yellow ROI: x={YELLOW_ROI[0]*100:.1f}%-{YELLOW_ROI[2]*100:.1f}%, y={YELLOW_ROI[1]*100:.1f}%-{YELLOW_ROI[3]*100:.1f}%")
-    print(f"\n🐛 DEBUG MODE:")
-    print(f"   • Frame ID overlay: Enabled")
-    print(f"   • ROI visualization: Enabled (Blue, Red, Yellow)")
-    print(f"   • Detection metrics: Area + Circularity/Solidity")
+    print(f"Video: {input_video}")
+    print(f"Resolution: {w_orig}x{h_orig} @ {fps:.2f} FPS")
+    print(f"Total frames: {total_frames}")
+    print(f"Processing limit: {MAX_FRAME_ID} frames")
+    print(f"\nCOLOR-SPECIFIC TEMPORAL PARAMETERS:")
+    print(f"   Blue:   min={BLUE_MIN_DURATION_SEC}s, gap={BLUE_MAX_GAP_SEC}s, iou={BLUE_IOU_THRESHOLD}")
+    print(f"   Red:    min={RED_MIN_DURATION_SEC}s, gap={RED_MAX_GAP_SEC}s, iou={RED_IOU_THRESHOLD}")
+    print(f"   Yellow: min={YELLOW_MIN_DURATION_SEC}s, gap={YELLOW_MAX_GAP_SEC}s, iou={YELLOW_IOU_THRESHOLD}")
+    print(f"\nOPTIMIZATION:")
+    print(f"   Detection cache: Pre-computed")
+    print(f"   Multi-processing: {NUM_PROCESS_WORKERS} worker processes (Detection Phase)")
+    print(f"   Multi-threading: {NUM_READ_THREADS + NUM_PROCESS_WORKERS} threads (Rendering Phase)")
+    print(f"   Frame buffer: {FRAME_BUFFER_SIZE} frames")
+    print(f"   Batch size: {BATCH_SIZE} frames/batch")
+    print(f"\nAREA PARAMETERS:")
+    print(f"   Circle:   min={CIRCLE_MIN_AREA}, max={CIRCLE_MAX_AREA}")
+    print(f"   Triangle: min={TRIANGLE_MIN_AREA}, max={TRIANGLE_MAX_AREA}")
+    print(f"\nROI SETTINGS (Full Frame %):")
+    print(f"   Blue ROI:   x={BLUE_ROI[0]*100:.1f}%-{BLUE_ROI[2]*100:.1f}%, y={BLUE_ROI[1]*100:.1f}%-{BLUE_ROI[3]*100:.1f}%")
+    print(f"   Red ROI:    x={RED_ROI[0]*100:.1f}%-{RED_ROI[2]*100:.1f}%, y={RED_ROI[1]*100:.1f}%-{RED_ROI[3]*100:.1f}%")
+    print(f"   Yellow ROI: x={YELLOW_ROI[0]*100:.1f}%-{YELLOW_ROI[2]*100:.1f}%, y={YELLOW_ROI[1]*100:.1f}%-{YELLOW_ROI[3]*100:.1f}%")
+    print(f"\nDEBUG MODE: {'ENABLED' if DEBUG_MODE else 'DISABLED'}")
+    if DEBUG_MODE:
+        print(f"   Frame ID overlay: Enabled")
+        print(f"   ROI visualization: Enabled")
+        print(f"   Detection metrics: Enabled")
+    else:
+        print(f"   Only bounding boxes will be shown")
     print("=" * 70)
     
     # =========================================================================
-    # PASS 1: DETECTION (MULTIPROCESSING)
+    # DETECTION PHASE: SIGN DETECTION AND TEMPORAL TRACKING
     # =========================================================================
     
-    print("\n🔍 PASS 1: Detecting traffic signs (multi-processing)...")
-    start_pass1 = time.time()
+    print("\nDETECTION PHASE: Detecting traffic signs (multi-processing)...")
+    start_detection = time.time()
     
-    temporal_filter = TemporalSignFilter(
-        fps, 
-        min_duration_sec=MIN_DURATION_SEC,
-        max_gap_sec=MAX_GAP_SEC,
-        iou_threshold=IOU_THRESHOLD
-    )
+    # Create color-specific parameter dictionary
+    color_params = {
+        'blue': (BLUE_MIN_DURATION_SEC, BLUE_MAX_GAP_SEC, BLUE_IOU_THRESHOLD),
+        'red': (RED_MIN_DURATION_SEC, RED_MAX_GAP_SEC, RED_IOU_THRESHOLD),
+        'yellow': (YELLOW_MIN_DURATION_SEC, YELLOW_MAX_GAP_SEC, YELLOW_IOU_THRESHOLD)
+    }
+    
+    temporal_filter = TemporalSignFilter(fps, color_params=color_params)
     
     # Read frames up to MAX_FRAME_ID for detection
-    print(f"   📖 Reading video frames (detecting up to frame {MAX_FRAME_ID})...")
+    print(f"   Reading video frames (detecting up to frame {MAX_FRAME_ID})...")
     cap = cv2.VideoCapture(input_video)
     
+    # Video cropping configuration
+    # height_new = int(h_orig * 0.475) means we crop to 47.5% of original height
+    # This focuses on the upper portion of the frame where traffic signs typically appear
     height_new = int(h_orig * 0.475)
     width_new = w_orig
     
@@ -816,15 +935,16 @@ def main():
         frame_count += 1
     
     cap.release()
-    print(f"   ✅ Loaded {len(all_frames)} frames for detection")
+    print(f"   Loaded {len(all_frames)} frames for detection")
     
     # Split frames into batches for parallel processing
-    print(f"   🔧 Processing with {NUM_PROCESS_WORKERS} parallel workers...")
+    print(f"   Processing with {NUM_PROCESS_WORKERS} parallel workers...")
     
     batches = []
     for i in range(0, len(all_frames), BATCH_SIZE):
         batch = all_frames[i:i+BATCH_SIZE]
-        batches.append((batch, height_new, width_new, w_orig, h_orig))
+        batches.append((batch, height_new, width_new, w_orig, h_orig, 
+                       CIRCLE_MIN_AREA, CIRCLE_MAX_AREA, TRIANGLE_MIN_AREA, TRIANGLE_MAX_AREA))
     
     # Process batches in parallel using multiprocessing
     all_detections_results = []
@@ -840,38 +960,39 @@ def main():
             
             if completed % 10 == 0 or completed == len(batches):
                 progress = int(completed / len(batches) * 100)
-                print(f"   📊 Processed {completed}/{len(batches)} batches ({progress}%)")
+                print(f"   Processed {completed}/{len(batches)} batches ({progress}%)")
     
     # Sort results by frame number and add to temporal filter
     all_detections_results.sort(key=lambda x: x[0])
     
-    print("   🔗 Building temporal tracks...")
+    print("   Building temporal tracks...")
     for frame_num, detections in all_detections_results:
         temporal_filter.add_detections(frame_num, detections)
     
-    end_pass1 = time.time()
+    end_detection = time.time()
     
     # Statistics
     total_tracks, valid_tracks = temporal_filter.get_statistics()
-    print(f"\n✅ PASS 1 completed in {end_pass1 - start_pass1:.2f}s")
-    print(f"📊 Statistics:")
-    print(f"   • Total tracks: {total_tracks}")
-    print(f"   • Valid tracks: {valid_tracks}")
-    print(f"   • Filtered: {total_tracks - valid_tracks}")
+    print(f"\nDETECTION PHASE completed in {end_detection - start_detection:.2f}s")
+    print(f"Statistics:")
+    print(f"   Total tracks: {total_tracks}")
+    print(f"   Valid tracks: {valid_tracks}")
+    print(f"   Filtered: {total_tracks - valid_tracks}")
     
     # =========================================================================
-    # PASS 2: OPTIMIZED RENDERING (WITH DEBUG OVERLAYS)
+    # RENDERING PHASE: APPLY FILTERS AND GENERATE OUTPUT VIDEO
     # =========================================================================
     
-    # Render ALL frames from the original video (not just detected frames)
-    success = optimized_pass2(
+    # Render ALL frames from the original video
+    success = optimized_rendering_phase(
         input_video, 
         final_output, 
         temporal_filter, 
         total_frames,  # Use total frames from original video
         fps, 
         (w_orig, h_orig),
-        roi_params_dict
+        roi_params_dict,
+        DEBUG_MODE
     )
     
     if not success:
@@ -881,33 +1002,34 @@ def main():
     # COMPLETION
     # =========================================================================
     
-    total_time = time.time() - start_pass1
+    total_time = time.time() - start_detection
     
     print("\n" + "=" * 70)
-    print("✅  PROCESSING COMPLETE!")
+    print("PROCESSING COMPLETE!")
     print("=" * 70)
-    print(f"📁 Output: {final_output}")
-    print(f"🎞️  Output frames: {total_frames} (full video)")
-    print(f"🔍 Detection frames: {len(all_frames)} (up to frame {MAX_FRAME_ID})")
-    print(f"⏱️  Total time: {total_time:.2f}s, {total_time/60:.2f} min")
-    print(f"⚡ Overall speed: {total_frames/total_time:.1f} FPS")
+    print(f"Output: {final_output}")
+    print(f"Output frames: {total_frames} (full video)")
+    print(f"Detection frames: {len(all_frames)} (up to frame {MAX_FRAME_ID})")
+    print(f"Total time: {total_time:.2f}s, {total_time/60:.2f} min")
+    print(f"Overall speed: {total_frames/total_time:.1f} FPS")
     
     if total_tracks > 0:
-        print(f"\n📈 Filtering:")
-        print(f"   • Retention: {valid_tracks/total_tracks*100:.1f}%")
+        print(f"\nFiltering:")
+        print(f"   Retention: {valid_tracks/total_tracks*100:.1f}%")
         
-    print("\n🚀 Optimizations applied:")
-    print(f"   ✓ Detection cache (pre-computed)")
-    print(f"   ✓ Multi-processing Pass 1 ({NUM_PROCESS_WORKERS} processes)")
-    print(f"   ✓ Multi-threaded Pass 2 ({NUM_READ_THREADS + NUM_PROCESS_WORKERS} threads)")
-    print(f"   ✓ Interpolation + Smoothing")
-    print(f"   ✓ Frame buffering ({FRAME_BUFFER_SIZE} frames)")
-    print(f"   ✓ Batch processing ({BATCH_SIZE} frames/batch)")
+    print("\nOptimizations applied:")
+    print(f"   Detection cache (pre-computed)")
+    print(f"   Multi-processing Detection Phase ({NUM_PROCESS_WORKERS} processes)")
+    print(f"   Multi-threaded Rendering Phase ({NUM_READ_THREADS + NUM_PROCESS_WORKERS} threads)")
+    print(f"   Interpolation + Smoothing")
+    print(f"   Frame buffering ({FRAME_BUFFER_SIZE} frames)")
+    print(f"   Batch processing ({BATCH_SIZE} frames/batch)")
     
-    print("\n🐛 Debug features enabled:")
-    print(f"   ✓ Frame ID overlay")
-    print(f"   ✓ ROI visualization (Blue, Red, Yellow)")
-    print(f"   ✓ Detection metrics (Area, Circularity/Solidity)")
+    if DEBUG_MODE:
+        print("\nDebug features enabled:")
+        print(f"   Frame ID overlay")
+        print(f"   ROI visualization (Blue, Red, Yellow)")
+        print(f"   Detection metrics (Area, Circularity/Solidity)")
     print("=" * 70)
 
 

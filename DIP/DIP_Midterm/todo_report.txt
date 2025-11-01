@@ -1,0 +1,48 @@
+- explain all the params 
+    - clahe 3.0, (1,1) why choose 3.0, why 1,1 not 8,8
+    - s * 1.5 why increase the s, why *1.5
+    - why 
+        height_new = int(h_orig * 0.475)
+        width_new = w_orig
+    - why MAX_FRAME_ID = 2800
+    - why WHYYYYYY 
+    - why .... 
+    - what is overlap_threshold
+
+- explain why using hsv 
+- explain why not combine 3 mask (red, blue, yellow) into one mask 
+- explain why apply morphology
+    -   why
+        if k_size % 2 == 0:
+        k_size += 1
+- 
+- explain in detail about the MAGIC ROI 
+- explain in detail why using convextHull, solidity, circularity
+- exlain in detail why using 2 circularity_param
+- explain why using min and max area 
+- explain why using approxPolyDP with epsilon 0.03 ... in detail 
+- explain in detail the logic of temporal filter 
+    - the pipeline of that filter 
+    - the logic behind the eliminate the false positive
+    - why using 3 params for (Temporal Filtering Parameters)
+    - iou
+    - interpolate_missing_frames
+    - smooth_bounding_boxes
+    - build_detection_cache
+
+
+
+
+
+
+- draw the pipeline general diagram 
+- draw the detail pipeline diagram (without using multiprocess for optimized the performace)
+- draw the general diagram pipeline with multiprocess
+- draw some logic behind the pipeline (temporal filter)
+- draw the flow chart for some algorithm in detection phase and temporal filter
+
+
+
+
+
+- add 3 images, min gap time 8 secs with bbox for chapter 2 result

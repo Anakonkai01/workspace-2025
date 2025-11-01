@@ -2,10 +2,6 @@ import cv2
 import numpy as np 
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-import queue
-from threading import Lock, Thread
-from multiprocessing import cpu_count, Manager, Queue, Process
 
 # =============================================================================
 # GLOBAL VARIABLES (Parameters)
@@ -102,26 +98,6 @@ DEBUG_MODE = False  # Set to False to disable ROI boxes and metrics overlay
 INPUT_VIDEO_PATH = 'task1.mp4'
 OUTPUT_VIDEO_PATH = 'task1_output.mp4'
 
-# --- Performance Parameters ---
-# Automatically detect CPU cores and optimize thread/process allocation
-CPU_CORES = cpu_count()
-
-# Calculate optimal number of reader threads
-NUM_READ_THREADS = max(1, min(4, CPU_CORES // 8))
-
-# Calculate optimal number of worker processes
-NUM_PROCESS_WORKERS = max(1, CPU_CORES - NUM_READ_THREADS - 2)
-
-# Frame buffer size scales with available cores
-# More cores = larger buffer for better throughput
-FRAME_BUFFER_SIZE = max(30, min(200, CPU_CORES * 4))
-
-# Batch size for frame processing
-# Balances between parallelism overhead and processing efficiency
-BATCH_SIZE = max(10, min(50, CPU_CORES))
-
-print(f"Detected {CPU_CORES} CPU cores")
-print(f"Using {NUM_READ_THREADS} readers + {NUM_PROCESS_WORKERS} processors")
 print(f"Debug mode: {'ENABLED' if DEBUG_MODE else 'DISABLED'}")
 
 
@@ -616,218 +592,48 @@ def draw_frame_id(frame, frame_num):
 
 
 # =============================================================================
-# OPTIMIZED RENDERING PHASE - THREADED VIDEO PROCESSING
+# DETECTION PROCESSING FUNCTION
 # =============================================================================
 
-def frame_reader_worker(video_path, frame_queue, start_frame, end_frame):
+def process_single_frame(frame_full, frame_num, height_new, width_new, roi_params_dict):
     """
-    Thread worker for reading frames
-    Reads frames in batches and puts them in queue
+    Process a single frame for detection
+    Returns list of detections for this frame
     """
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    # Crop frame for processing (top 47.5%)
+    frame_to_process = frame_full[0:height_new, 0:width_new]
     
-    for frame_num in range(start_frame, end_frame):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        frame_queue.put((frame_num, frame.copy()))
+    # Process BLUE
+    hsv_blue = preprocess_frame(frame_to_process, blue_clahe_clip_limit, blue_blur_ksize)
+    lower_blue = np.array([blue_lower_h, blue_lower_s, blue_lower_v])
+    upper_blue = np.array([blue_upper_h, blue_upper_s, blue_upper_v])
+    mask_blue = cv2.inRange(hsv_blue, lower_blue, upper_blue)
+    mask_blue_clean = morphology(mask_blue, blue_ksize, blue_open_iter, blue_close_iter)
     
-    cap.release()
-
-def frame_processor_worker(input_queue, output_queue, temporal_filter, roi_params_dict, debug_mode):
-    """
-    Thread worker for processing frames
-    Draws detections, ROI (if debug), and frame ID (if debug) on frames
-    """
-    while True:
-        try:
-            item = input_queue.get(timeout=1)
-            if item is None:  # Poison pill
-                break
-            
-            frame_num, frame = item
-            
-            # Get validated detections (from cache)
-            validated = temporal_filter.get_validated_detections(frame_num)
-            
-            frame_output = frame.copy()
-            
-            # Draw debug overlays only if debug mode is enabled
-            if debug_mode:
-                # Draw frame ID
-                frame_output = draw_frame_id(frame_output, frame_num)
-                
-                # Draw ROI boxes
-                frame_output = draw_roi_boxes(frame_output, roi_params_dict)
-            
-            # Draw detections (with or without metrics based on debug mode)
-            frame_output = draw_detections_with_metrics(frame_output, validated, debug_mode)
-            
-            # Put to output queue
-            output_queue.put((frame_num, frame_output))
-            
-        except queue.Empty:
-            continue
-
-
-# =============================================================================
-# MULTIPROCESSING FUNCTIONS FOR DETECTION PHASE
-# =============================================================================
-
-def process_frame_batch(args):
-    """
-    Process a batch of frames in parallel (Detection Phase)
-    This runs in separate processes to bypass GIL
-    """
-    frames_data, height_new, width_new, w_full, h_full, circle_min, circle_max, triangle_min, triangle_max = args
+    # Process RED
+    hsv_red = preprocess_frame(frame_to_process, red_clahe_clip_limit, red_blur_ksize)
+    lower_red = np.array([red_lower_h, red_lower_s, red_lower_v])
+    upper_red = np.array([red_upper_h, red_upper_s, red_upper_v])
+    mask_red = cv2.inRange(hsv_red, lower_red, upper_red)
+    mask_red_clean = morphology(mask_red, red_ksize, red_open_iter, red_close_iter)
     
-    # ROI parameters in FULL FRAME coordinates (convert from percentages)
-    blue_roi_params = convert_roi_to_pixels(BLUE_ROI, w_full, h_full)
-    red_roi_params = convert_roi_to_pixels(RED_ROI, w_full, h_full)
-    yellow_roi_params = convert_roi_to_pixels(YELLOW_ROI, w_full, h_full)
+    # Process YELLOW
+    hsv_yellow = preprocess_frame(frame_to_process, yellow_clahe_clip_limit, yellow_blur_ksize)
+    lower_yellow = np.array([yellow_lower_h, yellow_lower_s, yellow_lower_v])
+    upper_yellow = np.array([yellow_upper_h, yellow_upper_s, yellow_upper_v])
+    mask_yellow = cv2.inRange(hsv_yellow, lower_yellow, upper_yellow)
+    mask_yellow_clean = morphology(mask_yellow, yellow_ksize, yellow_open_iter, yellow_close_iter)
     
-    batch_results = []
+    # Extract detections (with metrics)
+    all_detections = []
+    all_detections.extend(extract_circle_detections(mask_blue_clean, roi_params_dict['blue'], 'blue', 
+                                                     CIRCLE_MIN_AREA, CIRCLE_MAX_AREA))
+    all_detections.extend(extract_circle_detections(mask_red_clean, roi_params_dict['red'], 'red', 
+                                                     CIRCLE_MIN_AREA, CIRCLE_MAX_AREA))
+    all_detections.extend(extract_triangle_detections(mask_yellow_clean, roi_params_dict['yellow'], 'yellow', 
+                                                       TRIANGLE_MIN_AREA, TRIANGLE_MAX_AREA))
     
-    for frame_num, frame_full in frames_data:
-        # Crop frame for processing (top 47.5%)
-        frame_to_process = frame_full[0:height_new, 0:width_new]
-        
-        # Process BLUE
-        hsv_blue = preprocess_frame(frame_to_process, blue_clahe_clip_limit, blue_blur_ksize)
-        lower_blue = np.array([blue_lower_h, blue_lower_s, blue_lower_v])
-        upper_blue = np.array([blue_upper_h, blue_upper_s, blue_upper_v])
-        mask_blue = cv2.inRange(hsv_blue, lower_blue, upper_blue)
-        mask_blue_clean = morphology(mask_blue, blue_ksize, blue_open_iter, blue_close_iter)
-        
-        # Process RED
-        hsv_red = preprocess_frame(frame_to_process, red_clahe_clip_limit, red_blur_ksize)
-        lower_red = np.array([red_lower_h, red_lower_s, red_lower_v])
-        upper_red = np.array([red_upper_h, red_upper_s, red_upper_v])
-        mask_red = cv2.inRange(hsv_red, lower_red, upper_red)
-        mask_red_clean = morphology(mask_red, red_ksize, red_open_iter, red_close_iter)
-        
-        # Process YELLOW
-        hsv_yellow = preprocess_frame(frame_to_process, yellow_clahe_clip_limit, yellow_blur_ksize)
-        lower_yellow = np.array([yellow_lower_h, yellow_lower_s, yellow_lower_v])
-        upper_yellow = np.array([yellow_upper_h, yellow_upper_s, yellow_upper_v])
-        mask_yellow = cv2.inRange(hsv_yellow, lower_yellow, upper_yellow)
-        mask_yellow_clean = morphology(mask_yellow, yellow_ksize, yellow_open_iter, yellow_close_iter)
-        
-        # Extract detections (with metrics and configurable area limits)
-        all_detections = []
-        all_detections.extend(extract_circle_detections(mask_blue_clean, blue_roi_params, 'blue', circle_min, circle_max))
-        all_detections.extend(extract_circle_detections(mask_red_clean, red_roi_params, 'red', circle_min, circle_max))
-        all_detections.extend(extract_triangle_detections(mask_yellow_clean, yellow_roi_params, 'yellow', triangle_min, triangle_max))
-        
-        batch_results.append((frame_num, all_detections))
-    
-    return batch_results
-
-def optimized_rendering_phase(input_video, output_video, temporal_filter, total_frames, fps, resolution, roi_params_dict, debug_mode):
-    """
-    OPTIMIZED RENDERING PHASE with multi-threading
-    
-    Architecture:
-    1. Reader threads: Read frames from video
-    2. Processor threads: Draw detections, ROI, frame ID (using cache)
-    3. Writer thread (main): Write frames to output video in order
-    
-    """
-    print(f"\nRENDERING PHASE: Video rendering (multi-threaded)...")
-    print(f"   Threads: {NUM_READ_THREADS} readers + {NUM_PROCESS_WORKERS} processors")
-    start_rendering = time.time()
-    
-    # Build detection cache first (if not already built)
-    if not temporal_filter._cache_built:
-        temporal_filter.build_detection_cache()
-    
-    # Create queues
-    read_queue = queue.Queue(maxsize=FRAME_BUFFER_SIZE)
-    process_queue = queue.Queue(maxsize=FRAME_BUFFER_SIZE)
-    
-    # Start reader thread
-    frames_per_reader = total_frames // NUM_READ_THREADS
-    reader_threads = []
-    
-    for i in range(NUM_READ_THREADS):
-        start_frame = i * frames_per_reader
-        end_frame = (i + 1) * frames_per_reader if i < NUM_READ_THREADS - 1 else total_frames
-        
-        from threading import Thread
-        t = Thread(target=frame_reader_worker, 
-                   args=(input_video, read_queue, start_frame, end_frame))
-        t.start()
-        reader_threads.append(t)
-    
-    # Start processor threads
-    processor_threads = []
-    for _ in range(NUM_PROCESS_WORKERS):
-        from threading import Thread
-        t = Thread(target=frame_processor_worker, 
-                   args=(read_queue, process_queue, temporal_filter, roi_params_dict, debug_mode))
-        t.start()
-        processor_threads.append(t)
-    
-    # Writer (main thread) - writes frames in order
-    w, h = resolution
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_video, fourcc, fps, (w, h))
-    
-    if not video_writer.isOpened():
-        print(f"❌ Error: Cannot create output file '{output_video}'")
-        return False
-    
-    # Buffer for out-of-order frames
-    frame_buffer = {}
-    next_frame_to_write = 0
-    frames_written = 0
-    
-    # Progress tracking
-    last_progress = 0
-    
-    while frames_written < total_frames:
-        try:
-            frame_num, frame_output = process_queue.get(timeout=5)
-            frame_buffer[frame_num] = frame_output
-            
-            # Write frames in order
-            while next_frame_to_write in frame_buffer:
-                video_writer.write(frame_buffer[next_frame_to_write])
-                del frame_buffer[next_frame_to_write]
-                next_frame_to_write += 1
-                frames_written += 1
-                
-                # Progress
-                progress = int(frames_written / total_frames * 100)
-                if progress >= last_progress + 10:
-                    print(f"   Rendered {frames_written}/{total_frames} frames ({progress}%)")
-                    last_progress = progress
-                    
-        except queue.Empty:
-            # Check if all readers finished
-            if all(not t.is_alive() for t in reader_threads):
-                break
-    
-    # Wait for all threads to finish
-    for t in reader_threads:
-        t.join()
-    
-    # Send poison pills to processors
-    for _ in range(NUM_PROCESS_WORKERS):
-        read_queue.put(None)
-    
-    for t in processor_threads:
-        t.join()
-    
-    video_writer.release()
-    end_rendering = time.time()
-    
-    print(f"   Rendering phase completed in {end_rendering - start_rendering:.2f}s")
-    print(f"   Rendering speed: {total_frames/(end_rendering - start_rendering):.1f} FPS")
-    
-    return True
+    return all_detections
 
 
 # =============================================================================
@@ -841,7 +647,7 @@ def main():
     # Check video
     cap_test = cv2.VideoCapture(input_video)
     if not cap_test.isOpened():
-        print(f"❌ Error: Cannot open video '{input_video}'")
+        print(f"Error: Cannot open video '{input_video}'")
         return
     cap_test.release()
     
@@ -856,7 +662,7 @@ def main():
     cap.release()
     
     print("=" * 70)
-    print("   TRAFFIC SIGN DETECTION WITH MULTI-PROCESSING & MULTI-THREADING")
+    print("   TRAFFIC SIGN DETECTION (SINGLE-THREADED VERSION)")
     print("=" * 70)
     print(f"Video: {input_video}")
     print(f"Resolution: {w_orig}x{h_orig} @ {fps:.2f} FPS")
@@ -866,12 +672,6 @@ def main():
     print(f"   Blue:   min={BLUE_MIN_DURATION_SEC}s, gap={BLUE_MAX_GAP_SEC}s, iou={BLUE_IOU_THRESHOLD}")
     print(f"   Red:    min={RED_MIN_DURATION_SEC}s, gap={RED_MAX_GAP_SEC}s, iou={RED_IOU_THRESHOLD}")
     print(f"   Yellow: min={YELLOW_MIN_DURATION_SEC}s, gap={YELLOW_MAX_GAP_SEC}s, iou={YELLOW_IOU_THRESHOLD}")
-    print(f"\nOPTIMIZATION:")
-    print(f"   Detection cache: Pre-computed")
-    print(f"   Multi-processing: {NUM_PROCESS_WORKERS} worker processes (Detection Phase)")
-    print(f"   Multi-threading: {NUM_READ_THREADS + NUM_PROCESS_WORKERS} threads (Rendering Phase)")
-    print(f"   Frame buffer: {FRAME_BUFFER_SIZE} frames")
-    print(f"   Batch size: {BATCH_SIZE} frames/batch")
     print(f"\nAREA PARAMETERS:")
     print(f"   Circle:   min={CIRCLE_MIN_AREA}, max={CIRCLE_MAX_AREA}")
     print(f"   Triangle: min={TRIANGLE_MIN_AREA}, max={TRIANGLE_MAX_AREA}")
@@ -892,7 +692,7 @@ def main():
     # DETECTION PHASE: SIGN DETECTION AND TEMPORAL TRACKING
     # =========================================================================
     
-    print("\nDETECTION PHASE: Detecting traffic signs (multi-processing)...")
+    print("\nDETECTION PHASE: Detecting traffic signs (single-threaded)...")
     start_detection = time.time()
     
     # Create color-specific parameter dictionary
@@ -903,10 +703,6 @@ def main():
     }
     
     temporal_filter = TemporalSignFilter(fps, color_params=color_params)
-    
-    # Read frames up to MAX_FRAME_ID for detection
-    print(f"   Reading video frames (detecting up to frame {MAX_FRAME_ID})...")
-    cap = cv2.VideoCapture(input_video)
     
     # Video cropping configuration
     # height_new = int(h_orig * 0.475) means we crop to 47.5% of original height
@@ -925,51 +721,34 @@ def main():
         'yellow': yellow_roi_params
     }
     
-    all_frames = []
-    frame_count = 0
+    # Process frames for detection (up to MAX_FRAME_ID)
+    print(f"   Reading and processing frames (up to frame {MAX_FRAME_ID})...")
+    cap = cv2.VideoCapture(input_video)
     
-    # Only process detections up to MAX_FRAME_ID
+    frame_count = 0
+    last_progress = 0
+    
     while cap.isOpened() and frame_count < MAX_FRAME_ID:
         ret, frame_full = cap.read()
         if not ret:
             break
-        all_frames.append((frame_count, frame_full))
+        
+        # Process frame and extract detections
+        detections = process_single_frame(frame_full, frame_count, height_new, width_new, roi_params_dict)
+        
+        # Add detections to temporal filter
+        temporal_filter.add_detections(frame_count, detections)
+        
         frame_count += 1
+        
+        # Progress update
+        progress = int(frame_count / MAX_FRAME_ID * 100)
+        if progress >= last_progress + 10:
+            print(f"   Processed {frame_count}/{MAX_FRAME_ID} frames ({progress}%)")
+            last_progress = progress
     
     cap.release()
-    print(f"   Loaded {len(all_frames)} frames for detection")
-    
-    # Split frames into batches for parallel processing
-    print(f"   Processing with {NUM_PROCESS_WORKERS} parallel workers...")
-    
-    batches = []
-    for i in range(0, len(all_frames), BATCH_SIZE):
-        batch = all_frames[i:i+BATCH_SIZE]
-        batches.append((batch, height_new, width_new, w_orig, h_orig, 
-                       CIRCLE_MIN_AREA, CIRCLE_MAX_AREA, TRIANGLE_MIN_AREA, TRIANGLE_MAX_AREA))
-    
-    # Process batches in parallel using multiprocessing
-    all_detections_results = []
-    
-    with ProcessPoolExecutor(max_workers=NUM_PROCESS_WORKERS) as executor:
-        futures = {executor.submit(process_frame_batch, batch): i for i, batch in enumerate(batches)}
-        
-        completed = 0
-        for future in as_completed(futures):
-            batch_results = future.result()
-            all_detections_results.extend(batch_results)
-            completed += 1
-            
-            if completed % 10 == 0 or completed == len(batches):
-                progress = int(completed / len(batches) * 100)
-                print(f"   Processed {completed}/{len(batches)} batches ({progress}%)")
-    
-    # Sort results by frame number and add to temporal filter
-    all_detections_results.sort(key=lambda x: x[0])
-    
-    print("   Building temporal tracks...")
-    for frame_num, detections in all_detections_results:
-        temporal_filter.add_detections(frame_num, detections)
+    print(f"   Processed {frame_count} frames for detection")
     
     end_detection = time.time()
     
@@ -981,24 +760,69 @@ def main():
     print(f"   Valid tracks: {valid_tracks}")
     print(f"   Filtered: {total_tracks - valid_tracks}")
     
+    # Build detection cache
+    temporal_filter.build_detection_cache()
+    
     # =========================================================================
     # RENDERING PHASE: APPLY FILTERS AND GENERATE OUTPUT VIDEO
     # =========================================================================
     
-    # Render ALL frames from the original video (not just detected frames)
-    success = optimized_rendering_phase(
-        input_video, 
-        final_output, 
-        temporal_filter, 
-        total_frames,  # Use total frames from original video
-        fps, 
-        (w_orig, h_orig),
-        roi_params_dict,
-        DEBUG_MODE
-    )
+    print(f"\nRENDERING PHASE: Generating output video (single-threaded)...")
+    start_rendering = time.time()
     
-    if not success:
+    # Open video for rendering all frames
+    cap = cv2.VideoCapture(input_video)
+    
+    # Create video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(final_output, fourcc, fps, (w_orig, h_orig))
+    
+    if not video_writer.isOpened():
+        print(f"Error: Cannot create output file '{final_output}'")
         return
+    
+    frame_num = 0
+    last_progress = 0
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Get validated detections from cache
+        validated = temporal_filter.get_validated_detections(frame_num)
+        
+        frame_output = frame.copy()
+        
+        # Draw debug overlays only if debug mode is enabled
+        if DEBUG_MODE:
+            # Draw frame ID
+            frame_output = draw_frame_id(frame_output, frame_num)
+            
+            # Draw ROI boxes
+            frame_output = draw_roi_boxes(frame_output, roi_params_dict)
+        
+        # Draw detections (with or without metrics based on debug mode)
+        frame_output = draw_detections_with_metrics(frame_output, validated, DEBUG_MODE)
+        
+        # Write frame to output video
+        video_writer.write(frame_output)
+        
+        frame_num += 1
+        
+        # Progress update
+        progress = int(frame_num / total_frames * 100)
+        if progress >= last_progress + 10:
+            print(f"   Rendered {frame_num}/{total_frames} frames ({progress}%)")
+            last_progress = progress
+    
+    cap.release()
+    video_writer.release()
+    
+    end_rendering = time.time()
+    
+    print(f"   Rendering phase completed in {end_rendering - start_rendering:.2f}s")
+    print(f"   Rendering speed: {total_frames/(end_rendering - start_rendering):.1f} FPS")
     
     # =========================================================================
     # COMPLETION
@@ -1011,7 +835,7 @@ def main():
     print("=" * 70)
     print(f"Output: {final_output}")
     print(f"Output frames: {total_frames} (full video)")
-    print(f"Detection frames: {len(all_frames)} (up to frame {MAX_FRAME_ID})")
+    print(f"Detection frames: {frame_count} (up to frame {MAX_FRAME_ID})")
     print(f"Total time: {total_time:.2f}s, {total_time/60:.2f} min")
     print(f"Overall speed: {total_frames/total_time:.1f} FPS")
     
@@ -1019,13 +843,10 @@ def main():
         print(f"\nFiltering:")
         print(f"   Retention: {valid_tracks/total_tracks*100:.1f}%")
         
-    print("\nOptimizations applied:")
-    print(f"   Detection cache (pre-computed)")
-    print(f"   Multi-processing Detection Phase ({NUM_PROCESS_WORKERS} processes)")
-    print(f"   Multi-threaded Rendering Phase ({NUM_READ_THREADS + NUM_PROCESS_WORKERS} threads)")
+    print("\nProcessing mode:")
+    print(f"   Single-threaded (no multiprocessing/multithreading)")
     print(f"   Interpolation + Smoothing")
-    print(f"   Frame buffering ({FRAME_BUFFER_SIZE} frames)")
-    print(f"   Batch processing ({BATCH_SIZE} frames/batch)")
+    print(f"   Detection cache (pre-computed)")
     
     if DEBUG_MODE:
         print("\nDebug features enabled:")
